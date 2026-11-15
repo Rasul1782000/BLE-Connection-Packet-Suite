@@ -1,0 +1,6 @@
+{
+  "name": "BLE Connection & Packet Suite",
+  "description": "Full-stack Bluetooth Low Energy (BLE) connection request manager, real-time WebSocket packet tracker, and audited Rust + Angular codebase.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

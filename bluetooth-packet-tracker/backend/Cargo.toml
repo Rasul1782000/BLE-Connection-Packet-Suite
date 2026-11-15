@@ -1,0 +1,16 @@
+[package]
+name = "bt-packet-tracker-monolith"
+version = "0.1.0"
+edition = "2021"
+description = "Monolithic Rust Bluetooth Connection Request & Packet Tracker Daemon"
+
+[dependencies]
+btleplug = "0.11"
+tokio = { version = "1.38", features = ["full"] }
+axum = { version = "0.7", features = ["ws"] }
+futures-util = "0.3"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1.8", features = ["v4", "serde"] }
+tower-http = { version = "0.5", features = ["cors"] }

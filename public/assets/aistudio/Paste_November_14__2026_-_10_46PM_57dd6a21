@@ -1,0 +1,1587 @@
+Bluetooth Connection Request & Packet Tracker Application
+
+A full-stack Bluetooth Low Energy (BLE) management and packet inspection suite. It combines a Monolithic Rust Backend (responsible for host controller scanning, GATT connection handshakes, service/characteristic discovery, and WebSocket packet streaming) with a Modular Angular Frontend (strictly partitioned into CoreModule, SharedModule, and lazy-loaded feature modules).
+
+1. System Architecture & Data Flow
+
++-----------------------------------------------------------------------------------+
+|                        MODULAR ANGULAR FRONTEND (Port 4200)                       |
+|                                                                                   |
+|  +---------------------------+     +-------------------------------------------+  |
+|  | ConnectionManagerModule   |     | PacketTrackerModule                       |  |
+|  | - Device Discovery Grid   |     | - Live Advertising & Handshake Sniffer    |  |
+|  | - GATT Connect/Disconnect |     | - Hex Payload & RSSI Telemetry Inspector  |  |
+|  +-------------+-------------+     +---------------------+---------------------+  |
+|                |                                         ^                        |
+|                | HTTP POST /api/connection               | WebSocket Stream       |
+|                v                                         | ws://.../ws/packets    |
+|  +-----------------------------------------------------------------------------+  |
+|  | CoreModule (BluetoothApiService - Singleton State & WebSocket Multiplexer)  |  |
+|  +-----------------------------------------------------------------------------+  |
++-----------------------------------------+-----------------------------------------+
+                                          |
+                                          v
++-----------------------------------------------------------------------------------+
+|                        MONOLITHIC RUST BACKEND (Port 8080)                        |
+|                                                                                   |
+|  +-----------------------------------------------------------------------------+  |
+|  | Axum HTTP & WebSocket Router (/api/health, /api/devices, /api/connection)   |  |
+|  +--------------------------------------+--------------------------------------+  |
+|                                         |                                         |
+|  +--------------------------------------v--------------------------------------+  |
+|  | Shared Application State (Arc<AppState> with RwLock & Broadcast Channel)    |  |
+|  +--------------------------------------+--------------------------------------+  |
+|                                         |                                         |
+|  +--------------------------------------v--------------------------------------+  |
+|  | BLE Packet & Connection Engine (btleplug Central, GATT Client & Event Loop) |  |
+|  +-----------------------------------------------------------------------------+  |
++-----------------------------------------------------------------------------------+
+                                          |
+                                          v
+                        [ Host Bluetooth 4.0+ / 5.x Hardware ]
+
+
+2. Complete Repository & File Layout
+
+bluetooth-packet-tracker/
+├── README.md
+├── backend/                                      # Monolithic Rust Application
+│   ├── Cargo.toml                                # Rust dependencies & binary metadata
+│   └── src/
+│       └── main.rs                               # Complete monolithic server, BLE engine & state
+│
+└── frontend/                                     # Modular Angular Application
+    ├── angular.json                              # Angular CLI workspace configuration
+    ├── package.json                              # NPM dependencies & build scripts
+    ├── tsconfig.json                             # Base TypeScript configuration
+    ├── tsconfig.app.json                         # Application TypeScript configuration
+    └── src/
+        ├── index.html                            # Main HTML entry document
+        ├── main.ts                               # Angular platform browser bootstrap
+        ├── styles.css                            # Global dark-theme styles & resets
+        └── app/
+            ├── core/                             # Core Singleton Module
+            │   ├── interceptors/
+            │   │   └── http-error.interceptor.ts # Global HTTP error logging & formatting
+            │   ├── models/
+            │   │   └── bluetooth.model.ts        # TypeScript interfaces for packets & GATT
+            │   ├── services/
+            │   │   └── bluetooth-api.service.ts  # Singleton REST & WebSocket client
+            │   └── core.module.ts                # Core module with re-import guard
+            │
+            ├── shared/                           # Shared Reusable Module
+            │   ├── components/
+            │   │   ├── rssi-badge/
+            │   │   │   └── rssi-badge.component.ts
+            │   │   └── status-indicator/
+            │   │       └── status-indicator.component.ts
+            │   ├── pipes/
+            │   │   └── hex-format.pipe.ts        # Formats raw hex strings into byte groups
+            │   └── shared.module.ts              # Exports common directives, pipes & UI widgets
+            │
+            ├── features/                         # Domain Feature Modules (Lazy Loaded)
+            │   ├── connection-manager/
+            │   │   ├── components/
+            │   │   │   └── device-card/
+            │   │   │       └── device-card.component.ts
+            │   │   ├── connection-manager.component.ts
+            │   │   └── connection-manager.module.ts
+            │   └── packet-tracker/
+            │       ├── components/
+            │       │   └── packet-filter/
+            │       │       └── packet-filter.component.ts
+            │       ├── packet-tracker.component.ts
+            │       └── packet-tracker.module.ts
+            │
+            ├── app-routing.module.ts             # Root lazy-loaded route definitions
+            ├── app.component.ts                  # Root application shell & navigation bar
+            └── app.module.ts                     # Root NgModule
+
+
+3. REST & WebSocket API Specification
+
+3.1 REST Endpoints
+
+Method
+
+Endpoint
+
+Request Payload
+
+Description
+
+GET
+
+/api/health
+
+None
+
+Returns daemon operational status and adapter info.
+
+GET
+
+/api/devices
+
+None
+
+Returns a JSON array of all cached PacketTelemetry peripherals.
+
+POST
+
+/api/connection
+
+{ "device_id": "...", "action": "CONNECT" | "DISCONNECT" }
+
+Initiates or terminates a GATT connection request with the target peripheral.
+
+3.2 WebSocket Telemetry Stream (ws://127.0.0.1:8080/ws/packets)
+
+Streams JSON-serialized PacketTelemetry objects in real time whenever an advertisement packet (ADV_IND), connection request (CONN_REQ_SENT), connection confirmation (CONN_ESTABLISHED), or disconnection (CONN_TERMINATED) occurs.
+
+{
+  "packet_id": "550e8400-e29b-41d4-a716-446655440000",
+  "device_id": "BluetoothLE#BluetoothLE00:1a:7d:da:71:13-ff:22:33:44:55:66",
+  "device_name": "MX Master 3S",
+  "mac_address": "FF:22:33:44:55:66",
+  "rssi": -48,
+  "packet_type": "CONN_ESTABLISHED",
+  "payload_hex": "02 01 06 03 03 12 18",
+  "gatt_services": ["00001800-0000-1000-8000-00805f9b34fb", "0000180f-0000-1000-8000-00805f9b34fb"],
+  "is_connected": true,
+  "timestamp": "2026-11-14T18:40:12.412Z"
+}
+
+
+4. Backend: Monolithic Rust Implementation
+
+The entire backend resides inside backend/src/main.rs as a self-contained monolith. It manages the hardware adapter lifecycle, maintains a thread-safe HashMap of discovered devices, processes incoming HTTP connection requests, and broadcasts packet events over a Tokio broadcast channel.
+
+4.1 backend/Cargo.toml
+
+[package]
+name = "bt-packet-tracker-monolith"
+version = "0.1.0"
+edition = "2021"
+description = "Monolithic Rust Bluetooth Connection Request & Packet Tracker Daemon"
+
+[dependencies]
+btleplug = "0.11"
+tokio = { version = "1.38", features = ["full"] }
+axum = { version = "0.7", features = ["ws"] }
+futures-util = "0.3"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1.8", features = ["v4", "serde"] }
+tower-http = { version = "0.5", features = ["cors"] }
+
+
+4.2 backend/src/main.rs
+
+use axum::{
+    extract::{
+        ws::{Message, WebSocket, WebSocketUpgrade},
+        State,
+    },
+    http::StatusCode,
+    response::IntoResponse,
+    routing::{get, post},
+    Json, Router,
+};
+use btleplug::api::{Central, CentralEvent, Manager as _, Peripheral as _, ScanFilter};
+use btleplug::platform::{Adapter, Manager};
+use chrono::{DateTime, Utc};
+use futures_util::StreamExt;
+use serde::{Deserialize, Serialize};
+use std::{collections::HashMap, sync::Arc, time::Duration};
+use tokio::sync::{broadcast, RwLock};
+use tower_http::cors::CorsLayer;
+use uuid::Uuid;
+
+// ============================================================================
+// 1. MONOLITHIC DATA MODELS & DTOs
+// ============================================================================
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct PacketTelemetry {
+    pub packet_id: String,
+    pub device_id: String,
+    pub device_name: String,
+    pub mac_address: String,
+    pub rssi: i16,
+    pub packet_type: String, // "ADV_IND", "CONN_REQ_SENT", "CONN_ESTABLISHED", "CONN_TERMINATED"
+    pub payload_hex: String,
+    pub gatt_services: Vec<String>,
+    pub is_connected: bool,
+    pub timestamp: DateTime<Utc>,
+}
+
+#[derive(Deserialize, Debug)]
+pub struct ConnectionRequestPayload {
+    pub device_id: String,
+    pub action: String, // "CONNECT" | "DISCONNECT"
+}
+
+#[derive(Serialize, Debug)]
+pub struct ActionResponse {
+    pub status: String,
+    pub message: String,
+    pub device_id: String,
+    pub discovered_services: Vec<String>,
+}
+
+#[derive(Serialize, Debug)]
+pub struct HealthStatus {
+    pub status: String,
+    pub adapter_info: String,
+    pub cached_device_count: usize,
+    pub timestamp: DateTime<Utc>,
+}
+
+// ============================================================================
+// 2. MONOLITHIC SHARED APPLICATION STATE
+// ============================================================================
+
+pub struct AppState {
+    pub tx: broadcast::Sender<PacketTelemetry>,
+    pub adapter: Adapter,
+    pub adapter_name: String,
+    pub tracked_devices: RwLock<HashMap<String, PacketTelemetry>>,
+}
+
+// ============================================================================
+// 3. APPLICATION ENTRY POINT
+// ============================================================================
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    println!("==================================================================");
+    println!("[Monolith] Booting Bluetooth Connection & Packet Tracker Daemon");
+    println!("==================================================================");
+
+    // Initialize Host Bluetooth Manager & Primary Adapter
+    let manager = Manager::new().await?;
+    let adapters = manager.adapters().await?;
+    let adapter = adapters
+        .into_iter()
+        .next()
+        .ok_or("Fatal: No Bluetooth hardware adapter detected on host machine.")?;
+
+    let adapter_info = adapter
+        .adapter_info()
+        .await
+        .unwrap_or_else(|_| "Primary Host BLE Adapter".to_string());
+    println!("[Hardware] Bound to adapter: {}", adapter_info);
+
+    // Create Broadcast Channel for Real-Time Packet Telemetry
+    let (tx, _rx) = broadcast::channel::<PacketTelemetry>(512);
+
+    let shared_state = Arc::new(AppState {
+        tx,
+        adapter: adapter.clone(),
+        adapter_name: adapter_info,
+        tracked_devices: RwLock::new(HashMap::new()),
+    });
+
+    // Spawn Background BLE Packet Sniffer & Event Loop
+    let scanner_state = Arc::clone(&shared_state);
+    tokio::spawn(async move {
+        if let Err(e) = run_ble_packet_engine(scanner_state).await {
+            eprintln!("[BLE Engine Fatal Error]: {}", e);
+        }
+    });
+
+    // Configure Monolithic HTTP REST & WebSocket Router
+    let app = Router::new()
+        .route("/api/health", get(health_check))
+        .route("/api/devices", get(get_discovered_devices))
+        .route("/api/connection", post(handle_connection_request))
+        .route("/ws/packets", get(ws_packet_handler))
+        .layer(CorsLayer::permissive())
+        .with_state(shared_state);
+
+    let bind_addr = "127.0.0.1:8080";
+    let listener = tokio::net::TcpListener::bind(bind_addr).await?;
+    println!("[Server] HTTP API active at http://{}", bind_addr);
+    println!("[Server] WebSocket Stream active at ws://{}/ws/packets", bind_addr);
+
+    axum::serve(listener, app).await?;
+    Ok(())
+}
+
+// ============================================================================
+// 4. BLUETOOTH PACKET CAPTURE & CONNECTION ENGINE
+// ============================================================================
+
+async fn run_ble_packet_engine(state: Arc<AppState>) -> Result<(), Box<dyn std::error::Error>> {
+    state.adapter.start_scan(ScanFilter::default()).await?;
+    println!("[BLE Engine] Active scanning started...");
+
+    let mut events = state.adapter.events().await?;
+
+    while let Some(event) = events.next().await {
+        match event {
+            CentralEvent::DeviceDiscovered(id) | CentralEvent::DeviceUpdated(id) => {
+                if let Ok(peripheral) = state.adapter.peripheral(&id).await {
+                    let props = peripheral.properties().await.unwrap_or(None);
+                    let is_connected = peripheral.is_connected().await.unwrap_or(false);
+
+                    let (name, mac, rssi, raw_hex) = if let Some(p) = props {
+                        // Extract Manufacturer Specific Data bytes as Hex
+                        let mut hex_bytes: Vec<String> = p
+                            .manufacturer_data
+                            .iter()
+                            .flat_map(|(company_id, data)| {
+                                let mut bytes = company_id.to_le_bytes().to_vec();
+                                bytes.extend_from_slice(data);
+                                bytes
+                            })
+                            .map(|b| format!("{:02X}", b))
+                            .collect();
+
+                        // Fallback to Service Data if Manufacturer Data is empty
+                        if hex_bytes.is_empty() {
+                            hex_bytes = p
+                                .service_data
+                                .values()
+                                .flatten()
+                                .map(|b| format!("{:02X}", b))
+                                .collect();
+                        }
+
+                        let payload = if hex_bytes.is_empty() {
+                            "02 01 06".to_string() // Standard BLE General Discoverable Flag
+                        } else {
+                            hex_bytes.join(" ")
+                        };
+
+                        (
+                            p.local_name.unwrap_or_else(|| "Unnamed Peripheral".to_string()),
+                            p.address.to_string(),
+                            p.rssi.unwrap_or(-100),
+                            payload,
+                        )
+                    } else {
+                        ("Unknown Device".to_string(), id.to_string(), -100, "00".to_string())
+                    };
+
+                    // Preserve previously discovered GATT services if device is already cached
+                    let existing_services = state
+                        .tracked_devices
+                        .read()
+                        .await
+                        .get(&id.to_string())
+                        .map(|d| d.gatt_services.clone())
+                        .unwrap_or_default();
+
+                    let packet = PacketTelemetry {
+                        packet_id: Uuid::new_v4().to_string(),
+                        device_id: id.to_string(),
+                        device_name: name,
+                        mac_address: mac,
+                        rssi,
+                        packet_type: "ADV_IND".to_string(),
+                        payload_hex: raw_hex,
+                        gatt_services: existing_services,
+                        is_connected,
+                        timestamp: Utc::now(),
+                    };
+
+                    state
+                        .tracked_devices
+                        .write()
+                        .await
+                        .insert(id.to_string(), packet.clone());
+
+                    let _ = state.tx.send(packet);
+                }
+            }
+            CentralEvent::DeviceConnected(id) => {
+                println!("[BLE Engine] Link established with {}", id);
+                broadcast_state_packet(&state, &id.to_string(), "CONN_ESTABLISHED", true, None).await;
+            }
+            CentralEvent::DeviceDisconnected(id) => {
+                println!("[BLE Engine] Link terminated with {}", id);
+                broadcast_state_packet(&state, &id.to_string(), "CONN_TERMINATED", false, Some(vec![])).await;
+            }
+            _ => {}
+        }
+    }
+
+    Ok(())
+}
+
+async fn broadcast_state_packet(
+    state: &Arc<AppState>,
+    device_id: &str,
+    event_type: &str,
+    connected: bool,
+    updated_services: Option<Vec<String>>,
+) {
+    let mut devices = state.tracked_devices.write().await;
+    if let Some(existing) = devices.get_mut(device_id) {
+        existing.is_connected = connected;
+        existing.packet_type = event_type.to_string();
+        existing.timestamp = Utc::now();
+        existing.packet_id = Uuid::new_v4().to_string();
+        if let Some(services) = updated_services {
+            existing.gatt_services = services;
+        }
+        let _ = state.tx.send(existing.clone());
+    }
+}
+
+// ============================================================================
+// 5. HTTP REST & WEBSOCKET HANDLERS
+// ============================================================================
+
+async fn health_check(State(state): State<Arc<AppState>>) -> Json<HealthStatus> {
+    let count = state.tracked_devices.read().await.len();
+    Json(HealthStatus {
+        status: "OPERATIONAL".to_string(),
+        adapter_info: state.adapter_name.clone(),
+        cached_device_count: count,
+        timestamp: Utc::now(),
+    })
+}
+
+async fn get_discovered_devices(State(state): State<Arc<AppState>>) -> Json<Vec<PacketTelemetry>> {
+    let devices = state.tracked_devices.read().await;
+    let mut list: Vec<PacketTelemetry> = devices.values().cloned().collect();
+    list.sort_by(|a, b| b.rssi.cmp(&a.rssi)); // Sort strongest signal first
+    Json(list)
+}
+
+async fn handle_connection_request(
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<ConnectionRequestPayload>,
+) -> (StatusCode, Json<ActionResponse>) {
+    let peripherals = match state.adapter.peripherals().await {
+        Ok(list) => list,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ActionResponse {
+                    status: "ERROR".to_string(),
+                    message: format!("Adapter peripheral query failed: {}", e),
+                    device_id: payload.device_id,
+                    discovered_services: vec![],
+                }),
+            )
+        }
+    };
+
+    for peripheral in peripherals {
+        if peripheral.id().to_string() == payload.device_id {
+            match payload.action.to_uppercase().as_str() {
+                "CONNECT" => {
+                    println!("[API] Initiating GATT CONNECT request to {}", payload.device_id);
+                    broadcast_state_packet(&state, &payload.device_id, "CONN_REQ_SENT", false, None).await;
+
+                    match tokio::time::timeout(Duration::from_secs(10), peripheral.connect()).await {
+                        Ok(Ok(_)) => {
+                            let _ = peripheral.discover_services().await;
+                            let services: Vec<String> = peripheral
+                                .services()
+                                .into_iter()
+                                .map(|s| s.uuid.to_string())
+                                .collect();
+
+                            broadcast_state_packet(
+                                &state,
+                                &payload.device_id,
+                                "CONN_ESTABLISHED",
+                                true,
+                                Some(services.clone()),
+                            )
+                            .await;
+
+                            return (
+                                StatusCode::OK,
+                                Json(ActionResponse {
+                                    status: "CONNECTED".to_string(),
+                                    message: format!(
+                                        "GATT connection established ({} services discovered)",
+                                        services.len()
+                                    ),
+                                    device_id: payload.device_id,
+                                    discovered_services: services,
+                                }),
+                            );
+                        }
+                        Ok(Err(e)) => {
+                            return (
+                                StatusCode::BAD_GATEWAY,
+                                Json(ActionResponse {
+                                    status: "REJECTED".to_string(),
+                                    message: format!("Peripheral rejected connection: {}", e),
+                                    device_id: payload.device_id,
+                                    discovered_services: vec![],
+                                }),
+                            );
+                        }
+                        Err(_) => {
+                            return (
+                                StatusCode::GATEWAY_TIMEOUT,
+                                Json(ActionResponse {
+                                    status: "TIMEOUT".to_string(),
+                                    message: "Connection handshake timed out after 10 seconds".to_string(),
+                                    device_id: payload.device_id,
+                                    discovered_services: vec![],
+                                }),
+                            );
+                        }
+                    }
+                }
+                "DISCONNECT" => {
+                    println!("[API] Initiating DISCONNECT request for {}", payload.device_id);
+                    match peripheral.disconnect().await {
+                        Ok(_) => {
+                            broadcast_state_packet(
+                                &state,
+                                &payload.device_id,
+                                "CONN_TERMINATED",
+                                false,
+                                Some(vec![]),
+                            )
+                            .await;
+
+                            return (
+                                StatusCode::OK,
+                                Json(ActionResponse {
+                                    status: "DISCONNECTED".to_string(),
+                                    message: "Peripheral disconnected cleanly".to_string(),
+                                    device_id: payload.device_id,
+                                    discovered_services: vec![],
+                                }),
+                            );
+                        }
+                        Err(e) => {
+                            return (
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                Json(ActionResponse {
+                                    status: "ERROR".to_string(),
+                                    message: format!("Disconnect failed: {}", e),
+                                    device_id: payload.device_id,
+                                    discovered_services: vec![],
+                                }),
+                            );
+                        }
+                    }
+                }
+                _ => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(ActionResponse {
+                            status: "INVALID_ACTION".to_string(),
+                            message: "Action must be CONNECT or DISCONNECT".to_string(),
+                            device_id: payload.device_id,
+                            discovered_services: vec![],
+                        }),
+                    );
+                }
+            }
+        }
+    }
+
+    (
+        StatusCode::NOT_FOUND,
+        Json(ActionResponse {
+            status: "NOT_FOUND".to_string(),
+            message: "Target peripheral not found in active scan cache".to_string(),
+            device_id: payload.device_id,
+            discovered_services: vec![],
+        }),
+    )
+}
+
+async fn ws_packet_handler(
+    ws: WebSocketUpgrade,
+    State(state): State<Arc<AppState>>,
+) -> impl IntoResponse {
+    ws.on_upgrade(move |socket| handle_ws_client(socket, state))
+}
+
+async fn handle_ws_client(mut socket: WebSocket, state: Arc<AppState>) {
+    let mut rx = state.tx.subscribe();
+    while let Ok(packet) = rx.recv().await {
+        if let Ok(json) = serde_json::to_string(&packet) {
+            if socket.send(Message::Text(json)).await.is_err() {
+                break;
+            }
+        }
+    }
+}
+
+
+5. Frontend: Modular Angular Implementation
+
+5.1 Workspace Configuration Files
+
+frontend/package.json
+
+{
+  "name": "bt-packet-tracker-frontend",
+  "version": "1.0.0",
+  "scripts": {
+    "ng": "ng",
+    "start": "ng serve",
+    "build": "ng build"
+  },
+  "private": true,
+  "dependencies": {
+    "@angular/animations": "^18.2.0",
+    "@angular/common": "^18.2.0",
+    "@angular/compiler": "^18.2.0",
+    "@angular/core": "^18.2.0",
+    "@angular/forms": "^18.2.0",
+    "@angular/platform-browser": "^18.2.0",
+    "@angular/platform-browser-dynamic": "^18.2.0",
+    "@angular/router": "^18.2.0",
+    "rxjs": "~7.8.0",
+    "tslib": "^2.3.0",
+    "zone.js": "~0.14.10"
+  },
+  "devDependencies": {
+    "@angular-devkit/build-angular": "^18.2.0",
+    "@angular/cli": "^18.2.0",
+    "@angular/compiler-cli": "^18.2.0",
+    "typescript": "~5.5.2"
+  }
+}
+
+
+frontend/angular.json
+
+{
+  "$schema": "./node_modules/@angular/cli/lib/config/schema.json",
+  "version": 1,
+  "newProjectRoot": "projects",
+  "projects": {
+    "bt-packet-tracker-frontend": {
+      "projectType": "application",
+      "root": "",
+      "sourceRoot": "src",
+      "prefix": "app",
+      "architect": {
+        "build": {
+          "builder": "@angular-devkit/build-angular:application",
+          "options": {
+            "outputPath": "dist/bt-packet-tracker-frontend",
+            "index": "src/index.html",
+            "browser": "src/main.ts",
+            "polyfills": ["zone.js"],
+            "tsConfig": "tsconfig.app.json",
+            "styles": ["src/styles.css"],
+            "scripts": []
+          }
+        },
+        "serve": {
+          "builder": "@angular-devkit/build-angular:dev-server",
+          "options": {
+            "buildTarget": "bt-packet-tracker-frontend:build",
+            "port": 4200
+          }
+        }
+      }
+    }
+  }
+}
+
+
+frontend/tsconfig.json
+
+{
+  "compileOnSave": false,
+  "compilerOptions": {
+    "outDir": "./dist/out-tsc",
+    "strict": true,
+    "noImplicitOverride": true,
+    "noPropertyAccessFromIndexSignature": true,
+    "noImplicitReturns": true,
+    "noFallthroughCasesInSwitch": true,
+    "skipLibCheck": true,
+    "esModuleInterop": true,
+    "sourceMap": true,
+    "declaration": false,
+    "experimentalDecorators": true,
+    "moduleResolution": "bundler",
+    "importHelpers": true,
+    "target": "ES2022",
+    "module": "ES2022",
+    "lib": ["ES2022", "dom"]
+  }
+}
+
+
+frontend/tsconfig.app.json
+
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "outDir": "./out-tsc/app",
+    "types": []
+  },
+  "files": ["src/main.ts"],
+  "include": ["src/**/*.d.ts"]
+}
+
+
+5.2 Application Bootstrap & Global Styles
+
+frontend/src/index.html
+
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>BLE Connection Request & Packet Tracker</title>
+  <base href="/">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+</head>
+<body>
+  <app-root></app-root>
+</body>
+</html>
+
+
+frontend/src/main.ts
+
+import { platformBrowserDynamic } from '@angular/platform-browser-dynamic';
+import { AppModule } from './app/app.module';
+
+platformBrowserDynamic()
+  .bootstrapModule(AppModule)
+  .catch((err) => console.error(err));
+
+
+frontend/src/styles.css
+
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  background-color: #09090b;
+  color: #f4f4f5;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+
+5.3 Core Module (frontend/src/app/core/)
+
+frontend/src/app/core/models/bluetooth.model.ts
+
+export interface PacketTelemetry {
+  packet_id: string;
+  device_id: string;
+  device_name: string;
+  mac_address: string;
+  rssi: number;
+  packet_type: 'ADV_IND' | 'CONN_REQ_SENT' | 'CONN_ESTABLISHED' | 'CONN_TERMINATED' | string;
+  payload_hex: string;
+  gatt_services: string[];
+  is_connected: boolean;
+  timestamp: string;
+}
+
+export interface ConnectionActionResponse {
+  status: string;
+  message: string;
+  device_id: string;
+  discovered_services: string[];
+}
+
+export interface HealthStatus {
+  status: string;
+  adapter_info: string;
+  cached_device_count: number;
+  timestamp: string;
+}
+
+
+frontend/src/app/core/interceptors/http-error.interceptor.ts
+
+import { Injectable } from '@angular/core';
+import {
+  HttpEvent,
+  HttpInterceptor,
+  HttpHandler,
+  HttpRequest,
+  HttpErrorResponse,
+} from '@angular/common/http';
+import { Observable, throwError } from 'rxjs';
+import { catchError } from 'rxjs/operators';
+
+@Injectable()
+export class HttpErrorInterceptor implements HttpInterceptor {
+  intercept(req: HttpRequest<unknown>, next: HttpHandler): Observable<HttpEvent<unknown>> {
+    return next.handle(req).pipe(
+      catchError((error: HttpErrorResponse) => {
+        console.error(`[HTTP Interceptor] ${req.method} ${req.url} failed:`, error.message);
+        return throwError(() => error);
+      })
+    );
+  }
+}
+
+
+frontend/src/app/core/services/bluetooth-api.service.ts
+
+import { Injectable } from '@angular/core';
+import { HttpClient } from '@angular/common/http';
+import { Observable, Subject, BehaviorSubject } from 'rxjs';
+import {
+  PacketTelemetry,
+  ConnectionActionResponse,
+  HealthStatus,
+} from '../models/bluetooth.model';
+
+@Injectable()
+export class BluetoothApiService {
+  private readonly baseUrl = 'http://127.0.0.1:8080/api';
+  private readonly wsUrl = 'ws://127.0.0.1:8080/ws/packets';
+
+  private socket!: WebSocket;
+  private packetStream$ = new Subject<PacketTelemetry>();
+  private deviceMap = new Map<string, PacketTelemetry>();
+  private devicesSubject$ = new BehaviorSubject<PacketTelemetry[]>([]);
+  private wsConnected$ = new BehaviorSubject<boolean>(false);
+
+  constructor(private http: HttpClient) {
+    this.initWebSocket();
+    this.loadInitialDevices();
+  }
+
+  private initWebSocket(): void {
+    this.socket = new WebSocket(this.wsUrl);
+
+    this.socket.onopen = () => {
+      this.wsConnected$.next(true);
+    };
+
+    this.socket.onmessage = (event: MessageEvent) => {
+      const packet: PacketTelemetry = JSON.parse(event.data);
+      this.packetStream$.next(packet);
+
+      this.deviceMap.set(packet.device_id, packet);
+      const sorted = Array.from(this.deviceMap.values()).sort((a, b) => b.rssi - a.rssi);
+      this.devicesSubject$.next(sorted);
+    };
+
+    this.socket.onclose = () => {
+      this.wsConnected$.next(false);
+      setTimeout(() => this.initWebSocket(), 2500);
+    };
+
+    this.socket.onerror = () => {
+      this.wsConnected$.next(false);
+    };
+  }
+
+  public getConnectionStatus(): Observable<boolean> {
+    return this.wsConnected$.asObservable();
+  }
+
+  public getBackendHealth(): Observable<HealthStatus> {
+    return this.http.get<HealthStatus>(`${this.baseUrl}/health`);
+  }
+
+  public loadInitialDevices(): void {
+    this.http.get<PacketTelemetry[]>(`${this.baseUrl}/devices`).subscribe({
+      next: (list) => {
+        list.forEach((d) => this.deviceMap.set(d.device_id, d));
+        this.devicesSubject$.next(Array.from(this.deviceMap.values()));
+      },
+    });
+  }
+
+  public getLivePackets(): Observable<PacketTelemetry> {
+    return this.packetStream$.asObservable();
+  }
+
+  public getTrackedDevices(): Observable<PacketTelemetry[]> {
+    return this.devicesSubject$.asObservable();
+  }
+
+  public sendConnectionRequest(
+    deviceId: string,
+    action: 'CONNECT' | 'DISCONNECT'
+  ): Observable<ConnectionActionResponse> {
+    return this.http.post<ConnectionActionResponse>(`${this.baseUrl}/connection`, {
+      device_id: deviceId,
+      action,
+    });
+  }
+}
+
+
+frontend/src/app/core/core.module.ts
+
+import { NgModule, Optional, SkipSelf } from '@angular/core';
+import { HttpClientModule, HTTP_INTERCEPTORS } from '@angular/common/http';
+import { BluetoothApiService } from './services/bluetooth-api.service';
+import { HttpErrorInterceptor } from './interceptors/http-error.interceptor';
+
+@NgModule({
+  imports: [HttpClientModule],
+  providers: [
+    BluetoothApiService,
+    {
+      provide: HTTP_INTERCEPTORS,
+      useClass: HttpErrorInterceptor,
+      multi: true,
+    },
+  ],
+})
+export class CoreModule {
+  constructor(@Optional() @SkipSelf() parentModule: CoreModule) {
+    if (parentModule) {
+      throw new Error('CoreModule is already loaded. Import it in AppModule only.');
+    }
+  }
+}
+
+
+5.4 Shared Module (frontend/src/app/shared/)
+
+frontend/src/app/shared/components/rssi-badge/rssi-badge.component.ts
+
+import { Component, Input } from '@angular/core';
+
+@Component({
+  selector: 'app-rssi-badge',
+  template: `
+    <span class="rssi-pill" [ngClass]="signalClass">
+      {{ rssi }} dBm • {{ label }}
+    </span>
+  `,
+  styles: [`
+    .rssi-pill {
+      display: inline-block;
+      padding: 3px 8px;
+      border-radius: 12px;
+      font-size: 11px;
+      font-weight: 600;
+      letter-spacing: 0.3px;
+    }
+    .strong { background: #14532d; color: #4ade80; border: 1px solid #166534; }
+    .medium { background: #713f12; color: #facc15; border: 1px solid #854d0e; }
+    .weak   { background: #7f1d1d; color: #f87171; border: 1px solid #991b1b; }
+  `]
+})
+export class RssiBadgeComponent {
+  @Input() rssi = -100;
+
+  get signalClass(): string {
+    if (this.rssi >= -55) return 'strong';
+    if (this.rssi >= -75) return 'medium';
+    return 'weak';
+  }
+
+  get label(): string {
+    if (this.rssi >= -55) return 'Immediate';
+    if (this.rssi >= -75) return 'Nearby';
+    return 'Far';
+  }
+}
+
+
+frontend/src/app/shared/components/status-indicator/status-indicator.component.ts
+
+import { Component, Input } from '@angular/core';
+
+@Component({
+  selector: 'app-status-indicator',
+  template: `
+    <div class="indicator">
+      <span class="dot" [class.online]="online"></span>
+      <span>{{ online ? onlineText : offlineText }}</span>
+    </div>
+  `,
+  styles: [`
+    .indicator { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: #a1a1aa; }
+    .dot { width: 8px; height: 8px; border-radius: 50%; background: #ef4444; }
+    .dot.online { background: #22c55e; box-shadow: 0 0 8px #22c55e; }
+  `]
+})
+export class StatusIndicatorComponent {
+  @Input() online = false;
+  @Input() onlineText = 'Daemon Connected';
+  @Input() offlineText = 'Daemon Offline';
+}
+
+
+frontend/src/app/shared/pipes/hex-format.pipe.ts
+
+import { Pipe, PipeTransform } from '@angular/core';
+
+@Pipe({
+  name: 'hexFormat'
+})
+export class HexFormatPipe implements PipeTransform {
+  transform(value: string): string {
+    if (!value) return '00';
+    return value
+      .replace(/[^0-9A-Fa-f]/g, '')
+      .match(/.{1,2}/g)
+      ?.join(' ')
+      .toUpperCase() || value;
+  }
+}
+
+
+frontend/src/app/shared/shared.module.ts
+
+import { NgModule } from '@angular/core';
+import { CommonModule } from '@angular/common';
+import { FormsModule } from '@angular/forms';
+import { RssiBadgeComponent } from './components/rssi-badge/rssi-badge.component';
+import { StatusIndicatorComponent } from './components/status-indicator/status-indicator.component';
+import { HexFormatPipe } from './pipes/hex-format.pipe';
+
+@NgModule({
+  declarations: [
+    RssiBadgeComponent,
+    StatusIndicatorComponent,
+    HexFormatPipe,
+  ],
+  imports: [CommonModule, FormsModule],
+  exports: [
+    CommonModule,
+    FormsModule,
+    RssiBadgeComponent,
+    StatusIndicatorComponent,
+    HexFormatPipe,
+  ],
+})
+export class SharedModule {}
+
+
+5.5 Feature Module 1: Connection Manager (frontend/src/app/features/connection-manager/)
+
+frontend/src/app/features/connection-manager/components/device-card/device-card.component.ts
+
+import { Component, Input, Output, EventEmitter } from '@angular/core';
+import { PacketTelemetry } from '../../../../core/models/bluetooth.model';
+
+@Component({
+  selector: 'app-device-card',
+  template: `
+    <div class="device-card" [class.active-link]="device.is_connected">
+      <div class="card-header">
+        <div>
+          <h3>{{ device.device_name }}</h3>
+          <span class="mac">{{ device.mac_address }}</span>
+        </div>
+        <app-rssi-badge [rssi]="device.rssi"></app-rssi-badge>
+      </div>
+
+      <div class="state-row">
+        <span>Link State:</span>
+        <strong [class.connected]="device.is_connected">
+          {{ device.is_connected ? 'GATT CONNECTED' : 'ADVERTISING' }}
+        </strong>
+      </div>
+
+      <div class="services-box" *ngIf="device.gatt_services?.length">
+        <div class="services-title">Discovered GATT Services ({{ device.gatt_services.length }}):</div>
+        <div class="service-uuid" *ngFor="let uuid of device.gatt_services">{{ uuid }}</div>
+      </div>
+
+      <div class="actions">
+        <button
+          class="btn-connect"
+          [disabled]="device.is_connected || isLoading"
+          (click)="actionRequested.emit({ device, action: 'CONNECT' })">
+          {{ isLoading && !device.is_connected ? 'Handshaking...' : 'Request Connect' }}
+        </button>
+        <button
+          class="btn-disconnect"
+          [disabled]="!device.is_connected || isLoading"
+          (click)="actionRequested.emit({ device, action: 'DISCONNECT' })">
+          Disconnect
+        </button>
+      </div>
+    </div>
+  `,
+  styles: [`
+    .device-card {
+      background: #09090b;
+      border: 1px solid #27272a;
+      border-radius: 8px;
+      padding: 16px;
+      display: flex;
+      flex-direction: column;
+      justify-content: space-between;
+      transition: border-color 0.2s;
+    }
+    .device-card.active-link { border-color: #22c55e; }
+    .card-header { display: flex; justify-content: space-between; align-items: flex-start; gap: 8px; margin-bottom: 12px; }
+    h3 { font-size: 15px; color: #f4f4f5; margin-bottom: 2px; }
+    .mac { font-family: monospace; font-size: 11px; color: #71717a; }
+    .state-row { display: flex; justify-content: space-between; font-size: 12px; color: #a1a1aa; padding: 8px 0; border-top: 1px solid #18181b; }
+    .connected { color: #4ade80; }
+    .services-box { background: #18181b; padding: 8px; border-radius: 4px; margin-top: 8px; max-height: 90px; overflow-y: auto; }
+    .services-title { font-size: 11px; color: #a1a1aa; margin-bottom: 4px; }
+    .service-uuid { font-family: monospace; font-size: 10px; color: #38bdf8; }
+    .actions { display: flex; gap: 8px; margin-top: 14px; }
+    button { flex: 1; padding: 8px 12px; border: none; border-radius: 5px; font-size: 12px; font-weight: 600; cursor: pointer; }
+    .btn-connect { background: #2563eb; color: #fff; }
+    .btn-connect:disabled { background: #1e3a8a; opacity: 0.45; cursor: not-allowed; }
+    .btn-disconnect { background: #dc2626; color: #fff; }
+    .btn-disconnect:disabled { background: #7f1d1d; opacity: 0.45; cursor: not-allowed; }
+  `]
+})
+export class DeviceCardComponent {
+  @Input() device!: PacketTelemetry;
+  @Input() isLoading = false;
+  @Output() actionRequested = new EventEmitter<{
+    device: PacketTelemetry;
+    action: 'CONNECT' | 'DISCONNECT';
+  }>();
+}
+
+
+frontend/src/app/features/connection-manager/connection-manager.component.ts
+
+import { Component, OnInit } from '@angular/core';
+import { Observable } from 'rxjs';
+import { BluetoothApiService } from '../../core/services/bluetooth-api.service';
+import { PacketTelemetry } from '../../core/models/bluetooth.model';
+
+@Component({
+  selector: 'app-connection-manager',
+  template: `
+    <section class="panel">
+      <div class="panel-header">
+        <div>
+          <h2>Bluetooth Connection Request Manager</h2>
+          <p class="subtitle">Select a discovered peripheral to initiate a GATT connection handshake.</p>
+        </div>
+        <button class="btn-refresh" (click)="refresh()">Sync Cache</button>
+      </div>
+
+      <div class="status-banner" *ngIf="statusMessage" [class.error]="isError">
+        {{ statusMessage }}
+      </div>
+
+      <div class="device-grid">
+        <app-device-card
+          *ngFor="let device of devices$ | async"
+          [device]="device"
+          [isLoading]="loadingId === device.device_id"
+          (actionRequested)="onActionRequested($event)">
+        </app-device-card>
+      </div>
+    </section>
+  `,
+  styles: [`
+    .panel { background: #18181b; padding: 24px; border-radius: 10px; border: 1px solid #27272a; }
+    .panel-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; }
+    h2 { font-size: 18px; margin-bottom: 4px; }
+    .subtitle { font-size: 13px; color: #a1a1aa; }
+    .btn-refresh { background: #27272a; color: #e4e4e7; border: 1px solid #3f3f46; padding: 6px 14px; border-radius: 6px; cursor: pointer; font-size: 12px; }
+    .status-banner { background: #0c4a6e; border: 1px solid #0284c7; color: #e0f2fe; padding: 10px 14px; border-radius: 6px; font-size: 13px; margin-bottom: 16px; }
+    .status-banner.error { background: #7f1d1d; border-color: #dc2626; color: #fee2e2; }
+    .device-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 16px; }
+  `]
+})
+export class ConnectionManagerComponent implements OnInit {
+  devices$!: Observable<PacketTelemetry[]>;
+  loadingId: string | null = null;
+  statusMessage = '';
+  isError = false;
+
+  constructor(private btService: BluetoothApiService) {}
+
+  ngOnInit(): void {
+    this.devices$ = this.btService.getTrackedDevices();
+  }
+
+  refresh(): void {
+    this.btService.loadInitialDevices();
+  }
+
+  onActionRequested(event: { device: PacketTelemetry; action: 'CONNECT' | 'DISCONNECT' }): void {
+    this.loadingId = event.device.device_id;
+    this.isError = false;
+    this.statusMessage = `Transmitting ${event.action} request to ${event.device.device_name}...`;
+
+    this.btService.sendConnectionRequest(event.device.device_id, event.action).subscribe({
+      next: (res) => {
+        this.statusMessage = `[${res.status}] ${res.message}`;
+        this.loadingId = null;
+      },
+      error: (err) => {
+        this.isError = true;
+        this.statusMessage = `[FAILED] ${err.error?.message || 'Connection request failed'}`;
+        this.loadingId = null;
+      },
+    });
+  }
+}
+
+
+frontend/src/app/features/connection-manager/connection-manager.module.ts
+
+import { NgModule } from '@angular/core';
+import { RouterModule, Routes } from '@angular/router';
+import { SharedModule } from '../../shared/shared.module';
+import { ConnectionManagerComponent } from './connection-manager.component';
+import { DeviceCardComponent } from './components/device-card/device-card.component';
+
+const routes: Routes = [{ path: '', component: ConnectionManagerComponent }];
+
+@NgModule({
+  declarations: [ConnectionManagerComponent, DeviceCardComponent],
+  imports: [SharedModule, RouterModule.forChild(routes)],
+})
+export class ConnectionManagerModule {}
+
+
+5.6 Feature Module 2: Packet Tracker (frontend/src/app/features/packet-tracker/)
+
+frontend/src/app/features/packet-tracker/components/packet-filter/packet-filter.component.ts
+
+import { Component, Output, EventEmitter } from '@angular/core';
+
+@Component({
+  selector: 'app-packet-filter',
+  template: `
+    <div class="filter-bar">
+      <input
+        type="text"
+        [(ngModel)]="searchTerm"
+        (ngModelChange)="emitFilter()"
+        placeholder="Filter by device name, MAC, or hex..."
+      />
+      <select [(ngModel)]="packetType" (ngModelChange)="emitFilter()">
+        <option value="ALL">All Packet Types</option>
+        <option value="ADV_IND">ADV_IND (Advertising)</option>
+        <option value="CONN_REQ_SENT">CONN_REQ_SENT</option>
+        <option value="CONN_ESTABLISHED">CONN_ESTABLISHED</option>
+        <option value="CONN_TERMINATED">CONN_TERMINATED</option>
+      </select>
+    </div>
+  `,
+  styles: [`
+    .filter-bar { display: flex; gap: 10px; margin-bottom: 14px; }
+    input, select {
+      background: #09090b;
+      border: 1px solid #27272a;
+      color: #f4f4f5;
+      padding: 8px 12px;
+      border-radius: 6px;
+      font-size: 13px;
+    }
+    input { flex: 1; }
+  `]
+})
+export class PacketFilterComponent {
+  searchTerm = '';
+  packetType = 'ALL';
+
+  @Output() filterChanged = new EventEmitter<{ searchTerm: string; packetType: string }>();
+
+  emitFilter(): void {
+    this.filterChanged.emit({
+      searchTerm: this.searchTerm.toLowerCase(),
+      packetType: this.packetType,
+    });
+  }
+}
+
+
+frontend/src/app/features/packet-tracker/packet-tracker.component.ts
+
+import { Component, OnInit, OnDestroy } from '@angular/core';
+import { Subscription } from 'rxjs';
+import { BluetoothApiService } from '../../core/services/bluetooth-api.service';
+import { PacketTelemetry } from '../../core/models/bluetooth.model';
+
+@Component({
+  selector: 'app-packet-tracker',
+  template: `
+    <section class="panel">
+      <div class="header-row">
+        <div>
+          <h2>Real-Time BLE Packet Sniffer & Telemetry</h2>
+          <p class="subtitle">Live HCI/ATT event stream captured from the host Bluetooth adapter.</p>
+        </div>
+        <div class="controls">
+          <button (click)="togglePause()">{{ isPaused ? 'Resume Stream' : 'Pause Stream' }}</button>
+          <button (click)="clearLogs()">Clear Buffer ({{ allPackets.length }})</button>
+        </div>
+      </div>
+
+      <app-packet-filter (filterChanged)="onFilterChanged($event)"></app-packet-filter>
+
+      <div class="table-wrapper">
+        <table>
+          <thead>
+            <tr>
+              <th>Timestamp (UTC)</th>
+              <th>Packet Type</th>
+              <th>Peripheral</th>
+              <th>Signal</th>
+              <th>Raw Hex Payload</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr *ngFor="let pkt of filteredPackets">
+              <td class="mono">{{ pkt.timestamp | date:'HH:mm:ss.SSS' }}</td>
+              <td>
+                <span class="type-tag" [ngClass]="pkt.packet_type.toLowerCase()">
+                  {{ pkt.packet_type }}
+                </span>
+              </td>
+              <td>
+                <div>{{ pkt.device_name }}</div>
+                <div class="mac-sub">{{ pkt.mac_address }}</div>
+              </td>
+              <td><app-rssi-badge [rssi]="pkt.rssi"></app-rssi-badge></td>
+              <td class="mono hex">{{ pkt.payload_hex | hexFormat }}</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+  `,
+  styles: [`
+    .panel { background: #18181b; padding: 24px; border-radius: 10px; border: 1px solid #27272a; }
+    .header-row { display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; }
+    h2 { font-size: 18px; margin-bottom: 4px; }
+    .subtitle { font-size: 13px; color: #a1a1aa; }
+    .controls { display: flex; gap: 8px; }
+    button { background: #27272a; color: #e4e4e7; border: 1px solid #3f3f46; padding: 6px 12px; border-radius: 6px; cursor: pointer; font-size: 12px; }
+    .table-wrapper { max-height: 520px; overflow-y: auto; border: 1px solid #27272a; border-radius: 6px; }
+    table { width: 100%; border-collapse: collapse; font-size: 13px; text-align: left; }
+    th, td { padding: 10px 12px; border-bottom: 1px solid #27272a; }
+    th { color: #a1a1aa; position: sticky; top: 0; background: #09090b; font-size: 12px; }
+    .mono { font-family: 'Courier New', monospace; }
+    .mac-sub { font-family: monospace; font-size: 11px; color: #71717a; }
+    .hex { color: #38bdf8; }
+    .type-tag { background: #312e81; color: #a5b4fc; padding: 3px 7px; border-radius: 4px; font-size: 11px; font-weight: 600; }
+    .type-tag.conn_established { background: #14532d; color: #4ade80; }
+    .type-tag.conn_terminated { background: #7f1d1d; color: #fca5a5; }
+    .type-tag.conn_req_sent { background: #713f12; color: #fde047; }
+  `]
+})
+export class PacketTrackerComponent implements OnInit, OnDestroy {
+  allPackets: PacketTelemetry[] = [];
+  filteredPackets: PacketTelemetry[] = [];
+  isPaused = false;
+
+  private searchTerm = '';
+  private packetType = 'ALL';
+  private sub!: Subscription;
+
+  constructor(private btService: BluetoothApiService) {}
+
+  ngOnInit(): void {
+    this.sub = this.btService.getLivePackets().subscribe((pkt) => {
+      if (this.isPaused) return;
+
+      this.allPackets.unshift(pkt);
+      if (this.allPackets.length > 250) {
+        this.allPackets.pop();
+      }
+      this.applyFilter();
+    });
+  }
+
+  onFilterChanged(filter: { searchTerm: string; packetType: string }): void {
+    this.searchTerm = filter.searchTerm;
+    this.packetType = filter.packetType;
+    this.applyFilter();
+  }
+
+  applyFilter(): void {
+    this.filteredPackets = this.allPackets.filter((pkt) => {
+      const matchesType = this.packetType === 'ALL' || pkt.packet_type === this.packetType;
+      const matchesSearch =
+        !this.searchTerm ||
+        pkt.device_name.toLowerCase().includes(this.searchTerm) ||
+        pkt.mac_address.toLowerCase().includes(this.searchTerm) ||
+        pkt.payload_hex.toLowerCase().includes(this.searchTerm);
+      return matchesType && matchesSearch;
+    });
+  }
+
+  togglePause(): void {
+    this.isPaused = !this.isPaused;
+  }
+
+  clearLogs(): void {
+    this.allPackets = [];
+    this.filteredPackets = [];
+  }
+
+  ngOnDestroy(): void {
+    if (this.sub) this.sub.unsubscribe();
+  }
+}
+
+
+frontend/src/app/features/packet-tracker/packet-tracker.module.ts
+
+import { NgModule } from '@angular/core';
+import { RouterModule, Routes } from '@angular/router';
+import { SharedModule } from '../../shared/shared.module';
+import { PacketTrackerComponent } from './packet-tracker.component';
+import { PacketFilterComponent } from './components/packet-filter/packet-filter.component';
+
+const routes: Routes = [{ path: '', component: PacketTrackerComponent }];
+
+@NgModule({
+  declarations: [PacketTrackerComponent, PacketFilterComponent],
+  imports: [SharedModule, RouterModule.forChild(routes)],
+})
+export class PacketTrackerModule {}
+
+
+5.7 Root Application Shell & Routing (frontend/src/app/)
+
+frontend/src/app/app-routing.module.ts
+
+import { NgModule } from '@angular/core';
+import { RouterModule, Routes } from '@angular/router';
+
+const routes: Routes = [
+  { path: '', redirectTo: 'connections', pathMatch: 'full' },
+  {
+    path: 'connections',
+    loadChildren: () =>
+      import('./features/connection-manager/connection-manager.module').then(
+        (m) => m.ConnectionManagerModule
+      ),
+  },
+  {
+    path: 'packets',
+    loadChildren: () =>
+      import('./features/packet-tracker/packet-tracker.module').then(
+        (m) => m.PacketTrackerModule
+      ),
+  },
+  { path: '**', redirectTo: 'connections' },
+];
+
+@NgModule({
+  imports: [RouterModule.forRoot(routes)],
+  exports: [RouterModule],
+})
+export class AppRoutingModule {}
+
+
+frontend/src/app/app.component.ts
+
+import { Component, OnInit } from '@angular/core';
+import { Observable } from 'rxjs';
+import { BluetoothApiService } from './core/services/bluetooth-api.service';
+
+@Component({
+  selector: 'app-root',
+  template: `
+    <div class="shell">
+      <nav class="navbar">
+        <div class="brand-group">
+          <span class="brand">BLE Connection & Packet Suite</span>
+          <app-status-indicator [online]="(isConnected$ | async) || false"></app-status-indicator>
+        </div>
+        <div class="links">
+          <a routerLink="/connections" routerLinkActive="active">Connection Requests</a>
+          <a routerLink="/packets" routerLinkActive="active">Packet Stream</a>
+        </div>
+      </nav>
+      <main class="content">
+        <router-outlet></router-outlet>
+      </main>
+    </div>
+  `,
+  styles: [`
+    .shell { min-height: 100vh; background: #09090b; color: #f4f4f5; }
+    .navbar {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 16px 32px;
+      background: #18181b;
+      border-bottom: 1px solid #27272a;
+    }
+    .brand-group { display: flex; align-items: center; gap: 16px; }
+    .brand { font-weight: 700; font-size: 16px; color: #38bdf8; }
+    .links { display: flex; gap: 12px; }
+    .links a {
+      color: #a1a1aa;
+      text-decoration: none;
+      font-size: 13px;
+      font-weight: 500;
+      padding: 7px 14px;
+      border-radius: 6px;
+      transition: all 0.15s;
+    }
+    .links a:hover { color: #fff; background: #27272a; }
+    .links a.active { background: #2563eb; color: #fff; }
+    .content { padding: 28px 32px; max-width: 1280px; margin: 0 auto; }
+  `]
+})
+export class AppComponent implements OnInit {
+  isConnected$!: Observable<boolean>;
+
+  constructor(private btService: BluetoothApiService) {}
+
+  ngOnInit(): void {
+    this.isConnected$ = this.btService.getConnectionStatus();
+  }
+}
+
+
+frontend/src/app/app.module.ts
+
+import { NgModule } from '@angular/core';
+import { BrowserModule } from '@angular/platform-browser';
+import { CoreModule } from './core/core.module';
+import { SharedModule } from './shared/shared.module';
+import { AppRoutingModule } from './app-routing.module';
+import { AppComponent } from './app.component';
+
+@NgModule({
+  declarations: [AppComponent],
+  imports: [BrowserModule, CoreModule, SharedModule, AppRoutingModule],
+  bootstrap: [AppComponent],
+})
+export class AppModule {}
+
+
+6. Build & Execution Guide
+
+6.1 Running the Monolithic Rust Backend
+
+Ensure Bluetooth is turned on in your operating system settings.
+
+Navigate to the backend folder and compile/run the single-binary monolith:
+
+cd backend
+cargo run --release
+
+
+Verify the server starts on http://127.0.0.1:8080 and begins scanning for BLE peripherals.
+
+6.2 Running the Modular Angular Frontend
+
+Open a new terminal window and navigate to the frontend directory:
+
+cd frontend
+npm install
+npx ng serve --open
+
+
+Open http://localhost:4200 in your browser:
+
+Connection Requests (/connections): View discovered peripherals, inspect RSSI proximity, and initiate or terminate GATT connection requests.
+
+Packet Stream (/packets): Monitor live advertising (ADV_IND) and connection handshake packets with hex payload inspection and filtering.
